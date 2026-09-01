@@ -474,6 +474,8 @@ class OBCameraNode {
 
   void onNewColorFrameCallback();
 
+  void onNewDepthFrameCallback();
+
   void onNewLeftColorFrameCallback();
 
   void onNewRightColorFrameCallback();
@@ -776,6 +778,46 @@ class OBCameraNode {
   std::shared_ptr<std::thread> colorFrameThread_ = nullptr;
   std::mutex color_frame_queue_lock_;
   std::condition_variable color_frame_queue_cv_;
+
+  //: How many framesets a worker queue may hold before the oldest is dropped.
+  //:
+  //: FOUR, not one, and that is measured. Depth-1 -- the newest frame replacing
+  //: whatever waits -- is what zed-ros2-wrapper does and it is the right shape
+  //: when the worker only publishes. Ours does not: the colour worker runs a
+  //: MJPEG decode first, and any decode that overruns a 33 ms frame loses the
+  //: frame that arrived during it, because there is no slack to put it in.
+  //: Colour measured 30.17 Hz +/-0.8 at four and 28.25 +/-8.7 at one, with the
+  //: gaps at exactly two frame times. Depth, whose worker only publishes, reads
+  //: 23.14 either way -- as the explanation predicts.
+  //:
+  //: Four is ~130 ms at 30 fps: enough to absorb a slow decode, short enough
+  //: that latency cannot run away.
+  //:
+  //: The queues used to be unbounded, which is survivable only while the worker
+  //: never blocks. It blocks the moment a stream is published RELIABLE and a
+  //: subscriber falls behind, and then the queue grows without limit -- every
+  //: entry pinning an SDK frame buffer. Measured on a Femto Bolt with RELIABLE
+  //: depth: standing latency 15.0 s -> 21.6 s -> 27.2 s over one minute, ending
+  //: in `Alloc frame buffer failed! size=1843719 status:104`, taking colour down
+  //: with it.
+  //:
+  //: What matters is that it is BOUNDED, which is where the other two drivers on
+  //: this robot already were: zed-ros2-wrapper hands its worker a single
+  //: latest-value slot behind a flag (threadFunc_videoDepthElab), and
+  //: realsense-ros keeps no queue at all and publishes straight from the
+  //: librealsense callback. Orbbec was the only one that could grow.
+  static constexpr size_t kFrameQueueMax = 4;
+
+  // For depth. Depth used to be published inline from onNewFrameSetCallback,
+  // i.e. on the SDK's own frame delivery thread, while all three colour streams
+  // had a queue and a worker of their own. That asymmetry showed up exactly
+  // where you would expect it: on a Femto Bolt the colour ran a metronomic
+  // 30.17 Hz while depth sat at 23, with the uvcvideo frame counter proving the
+  // device handed over 30.2 fps of BOTH. This gives depth the same treatment.
+  std::queue<std::shared_ptr<ob::FrameSet>> depth_frame_queue_;
+  std::shared_ptr<std::thread> depthFrameThread_ = nullptr;
+  std::mutex depth_frame_queue_lock_;
+  std::condition_variable depth_frame_queue_cv_;
 
   // For left color
   std::queue<std::shared_ptr<ob::FrameSet>> left_color_frame_queue_;

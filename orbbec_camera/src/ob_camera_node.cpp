@@ -565,6 +565,10 @@ void OBCameraNode::clean() noexcept {
       color_frame_queue_cv_.notify_all();
       colorFrameThread_->join();
     }
+    if (depthFrameThread_ && depthFrameThread_->joinable()) {
+      depth_frame_queue_cv_.notify_all();
+      depthFrameThread_->join();
+    }
     if (leftColorFrameThread_ && leftColorFrameThread_->joinable()) {
       left_color_frame_queue_cv_.notify_all();
       leftColorFrameThread_->join();
@@ -2120,6 +2124,9 @@ void OBCameraNode::startStreams() {
   }
   if (enable_stream_[COLOR] && !colorFrameThread_) {
     colorFrameThread_ = std::make_shared<std::thread>([this]() { onNewColorFrameCallback(); });
+  }
+  if (enable_stream_[DEPTH] && !depthFrameThread_) {
+    depthFrameThread_ = std::make_shared<std::thread>([this]() { onNewDepthFrameCallback(); });
   }
   if (enable_stream_[COLOR_LEFT] && !leftColorFrameThread_) {
     leftColorFrameThread_ =
@@ -3841,6 +3848,9 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
 
     if (enable_stream_[COLOR] && color_frame) {
       std::unique_lock<std::mutex> lock(color_frame_queue_lock_);
+      while (color_frame_queue_.size() >= kFrameQueueMax) {
+        color_frame_queue_.pop();   // drop the oldest; see kFrameQueueMax
+      }
       color_frame_queue_.push(frame_set);
       color_frame_queue_cv_.notify_all();
     } else {
@@ -3849,20 +3859,39 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
 
     if (enable_stream_[COLOR_LEFT] && left_color_frame) {
       std::unique_lock<std::mutex> lock(left_color_frame_queue_lock_);
+      while (left_color_frame_queue_.size() >= kFrameQueueMax) {
+        left_color_frame_queue_.pop();   // drop the oldest; see kFrameQueueMax
+      }
       left_color_frame_queue_.push(frame_set);
       left_color_frame_queue_cv_.notify_all();
     }
     if (enable_stream_[COLOR_RIGHT] && right_color_frame) {
       std::unique_lock<std::mutex> lock(right_color_frame_queue_lock_);
+      while (right_color_frame_queue_.size() >= kFrameQueueMax) {
+        right_color_frame_queue_.pop();   // drop the oldest; see kFrameQueueMax
+      }
       right_color_frame_queue_.push(frame_set);
       right_color_frame_queue_cv_.notify_all();
+    }
+
+    // Depth goes to its own worker for the same reason the colour streams do:
+    // publishing here would do it on the SDK's delivery thread. IR is left
+    // inline -- it is off in every configuration we run, and giving it a thread
+    // too would be a change with nothing measured behind it.
+    if (enable_stream_[DEPTH] && frame_set->getFrame(OB_FRAME_DEPTH) != nullptr) {
+      std::unique_lock<std::mutex> lock(depth_frame_queue_lock_);
+      while (depth_frame_queue_.size() >= kFrameQueueMax) {
+        depth_frame_queue_.pop();   // drop the oldest; see kFrameQueueMax
+      }
+      depth_frame_queue_.push(frame_set);
+      depth_frame_queue_cv_.notify_all();
     }
 
     for (const auto &stream_index : IMAGE_STREAMS) {
       if (enable_stream_[stream_index]) {
         auto frame_type = STREAM_TYPE_TO_FRAME_TYPE.at(stream_index.first);
         if (frame_type == OB_FRAME_COLOR || frame_type == OB_FRAME_COLOR_LEFT ||
-            frame_type == OB_FRAME_COLOR_RIGHT) {
+            frame_type == OB_FRAME_COLOR_RIGHT || frame_type == OB_FRAME_DEPTH) {
           continue;
         }
 
@@ -3905,56 +3934,102 @@ void OBCameraNode::logFrameInfoOnce(const stream_index_pair &stream_index,
 }
 
 void OBCameraNode::onNewColorFrameCallback() {
+  // The lock is released before the decode and the publish, not after. The
+  // producer -- onNewFrameSetCallback, which runs on the SDK's own frame
+  // delivery thread -- blocks on this same mutex to push the next frameset, so
+  // holding it across a decode and a DDS publish stalls the SDK's pipeline and
+  // it starts discarding frames. Measured on a Femto Bolt before this change:
+  // 17 Hz out of a 30 Hz sensor, 669 ms of standing latency, 150-500 ms gaps,
+  // with the process at 0.5 of one core of 16 and zero USB errors -- everything
+  // was waiting on this mutex rather than doing work. Popping inside the lock
+  // matters too: the old order left the item in the queue for the whole of the
+  // processing, so the queue never looked empty to anyone watching it.
   while (enable_stream_[COLOR] && rclcpp::ok() && is_running_.load()) {
-    std::unique_lock<std::mutex> lock(color_frame_queue_lock_);
-    color_frame_queue_cv_.wait(
-        lock, [this]() { return !color_frame_queue_.empty() || !(is_running_.load()); });
+    std::shared_ptr<ob::FrameSet> frameSet;
+    {
+      std::unique_lock<std::mutex> lock(color_frame_queue_lock_);
+      color_frame_queue_cv_.wait(
+          lock, [this]() { return !color_frame_queue_.empty() || !(is_running_.load()); });
 
-    if (!rclcpp::ok() || !is_running_.load()) {
-      break;
+      if (!rclcpp::ok() || !is_running_.load()) {
+        break;
+      }
+      frameSet = color_frame_queue_.front();
+      color_frame_queue_.pop();
     }
-    std::shared_ptr<ob::FrameSet> frameSet = color_frame_queue_.front();
     is_color_frame_decoded_ = decodeColorFrameToBuffer(frameSet->colorFrame(), rgb_buffer_);
     onNewFrameCallback(frameSet->colorFrame(), COLOR);
     publishPointCloud(frameSet);
-    color_frame_queue_.pop();
   }
 
   RCLCPP_DEBUG_STREAM(logger_, "Color frame thread exited");
 }
 
+void OBCameraNode::onNewDepthFrameCallback() {
+  // Mirrors onNewColorFrameCallback, including releasing the lock before the
+  // publish. Depth is where it matters most: with depth_registration on, the
+  // published frame is the depth resampled into the COLOUR frame -- 1.84 MB at
+  // 1280x720 -- and pushing that through DDS from the SDK's delivery thread is
+  // what the SDK ends up waiting on.
+  while (enable_stream_[DEPTH] && rclcpp::ok() && is_running_.load()) {
+    std::shared_ptr<ob::FrameSet> frameSet;
+    {
+      std::unique_lock<std::mutex> lock(depth_frame_queue_lock_);
+      depth_frame_queue_cv_.wait(
+          lock, [this]() { return !depth_frame_queue_.empty() || !(is_running_.load()); });
+
+      if (!rclcpp::ok() || !is_running_.load()) {
+        break;
+      }
+      frameSet = depth_frame_queue_.front();
+      depth_frame_queue_.pop();
+    }
+    auto frame = frameSet->getFrame(OB_FRAME_DEPTH);
+    if (frame != nullptr) {
+      onNewFrameCallback(frame, DEPTH);
+    }
+  }
+  RCLCPP_DEBUG_STREAM(logger_, "Depth frame thread exited");
+}
+
 void OBCameraNode::onNewLeftColorFrameCallback() {
   while (enable_stream_[COLOR_LEFT] && rclcpp::ok() && is_running_.load()) {
-    std::unique_lock<std::mutex> lock(left_color_frame_queue_lock_);
-    left_color_frame_queue_cv_.wait(
-        lock, [this]() { return !left_color_frame_queue_.empty() || !(is_running_.load()); });
+    std::shared_ptr<ob::FrameSet> frameSet;   // see onNewColorFrameCallback
+    {
+      std::unique_lock<std::mutex> lock(left_color_frame_queue_lock_);
+      left_color_frame_queue_cv_.wait(
+          lock, [this]() { return !left_color_frame_queue_.empty() || !(is_running_.load()); });
 
-    if (!rclcpp::ok() || !is_running_.load()) {
-      break;
+      if (!rclcpp::ok() || !is_running_.load()) {
+        break;
+      }
+      frameSet = left_color_frame_queue_.front();
+      left_color_frame_queue_.pop();
     }
-    std::shared_ptr<ob::FrameSet> frameSet = left_color_frame_queue_.front();
     is_left_color_frame_decoded_ =
         decodeColorFrameToBuffer(frameSet->getFrame(OB_FRAME_COLOR_LEFT), rgb_buffer_left_);
     onNewFrameCallback(frameSet->getFrame(OB_FRAME_COLOR_LEFT), COLOR_LEFT);
-    left_color_frame_queue_.pop();
   }
   RCLCPP_DEBUG_STREAM(logger_, "Left color frame thread exited");
 }
 
 void OBCameraNode::onNewRightColorFrameCallback() {
   while (enable_stream_[COLOR_RIGHT] && rclcpp::ok() && is_running_.load()) {
-    std::unique_lock<std::mutex> lock(right_color_frame_queue_lock_);
-    right_color_frame_queue_cv_.wait(
-        lock, [this]() { return !right_color_frame_queue_.empty() || !(is_running_.load()); });
+    std::shared_ptr<ob::FrameSet> frameSet;   // see onNewColorFrameCallback
+    {
+      std::unique_lock<std::mutex> lock(right_color_frame_queue_lock_);
+      right_color_frame_queue_cv_.wait(
+          lock, [this]() { return !right_color_frame_queue_.empty() || !(is_running_.load()); });
 
-    if (!rclcpp::ok() || !is_running_.load()) {
-      break;
+      if (!rclcpp::ok() || !is_running_.load()) {
+        break;
+      }
+      frameSet = right_color_frame_queue_.front();
+      right_color_frame_queue_.pop();
     }
-    std::shared_ptr<ob::FrameSet> frameSet = right_color_frame_queue_.front();
     is_right_color_frame_decoded_ =
         decodeColorFrameToBuffer(frameSet->getFrame(OB_FRAME_COLOR_RIGHT), rgb_buffer_right_);
     onNewFrameCallback(frameSet->getFrame(OB_FRAME_COLOR_RIGHT), COLOR_RIGHT);
-    right_color_frame_queue_.pop();
   }
   RCLCPP_DEBUG_STREAM(logger_, "Right color frame thread exited");
 }
