@@ -806,7 +806,14 @@ class OBCameraNode {
   //: latest-value slot behind a flag (threadFunc_videoDepthElab), and
   //: realsense-ros keeps no queue at all and publishes straight from the
   //: librealsense callback. Orbbec was the only one that could grow.
-  static constexpr size_t kFrameQueueMax = 4;
+  //: A parameter, not a constant, because the two halves of it are different
+  //: kinds of thing: that the queue is BOUNDED is correctness -- unbounded, a
+  //: blocked worker eats the SDK's frame buffers -- while the number itself is
+  //: tuning against how long a decode takes on this host. A slower machine may
+  //: want more; the failure there is graceful (frames drop, rate falls) rather
+  //: than the runaway an unbounded queue gives, so this can be raised in the
+  //: field without a rebuild. Clamped to at least 1 on read.
+  int frame_queue_size_ = 4;
 
   // For depth. Depth used to be published inline from onNewFrameSetCallback,
   // i.e. on the SDK's own frame delivery thread, while all three colour streams

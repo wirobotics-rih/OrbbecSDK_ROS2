@@ -2687,6 +2687,12 @@ void OBCameraNode::getParameters() {
   setAndGetNodeParameter<bool>(enable_heartbeat_, "enable_heartbeat", false);
   setAndGetNodeParameter<bool>(enable_firmware_log_, "enable_firmware_log", false);
   setAndGetNodeParameter<bool>(enable_color_undistortion_, "enable_color_undistortion", false);
+  setAndGetNodeParameter<int>(frame_queue_size_, "frame_queue_size", 4);
+  if (frame_queue_size_ < 1) {
+    RCLCPP_WARN_STREAM(logger_, "frame_queue_size " << frame_queue_size_
+                                                    << " is below 1; using 1");
+    frame_queue_size_ = 1;
+  }
   setAndGetNodeParameter<std::string>(time_domain_, "time_domain", "global");
   setAndGetNodeParameter<bool>(enable_frame_timestamp_csv_, "enable_frame_timestamp_csv", false);
   setAndGetNodeParameter<std::string>(frame_timestamp_csv_file_, "frame_timestamp_csv_file", "");
@@ -3848,8 +3854,8 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
 
     if (enable_stream_[COLOR] && color_frame) {
       std::unique_lock<std::mutex> lock(color_frame_queue_lock_);
-      while (color_frame_queue_.size() >= kFrameQueueMax) {
-        color_frame_queue_.pop();   // drop the oldest; see kFrameQueueMax
+      while (color_frame_queue_.size() >= static_cast<size_t>(frame_queue_size_)) {
+        color_frame_queue_.pop();   // drop the oldest; see frame_queue_size_
       }
       color_frame_queue_.push(frame_set);
       color_frame_queue_cv_.notify_all();
@@ -3859,16 +3865,16 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
 
     if (enable_stream_[COLOR_LEFT] && left_color_frame) {
       std::unique_lock<std::mutex> lock(left_color_frame_queue_lock_);
-      while (left_color_frame_queue_.size() >= kFrameQueueMax) {
-        left_color_frame_queue_.pop();   // drop the oldest; see kFrameQueueMax
+      while (left_color_frame_queue_.size() >= static_cast<size_t>(frame_queue_size_)) {
+        left_color_frame_queue_.pop();   // drop the oldest; see frame_queue_size_
       }
       left_color_frame_queue_.push(frame_set);
       left_color_frame_queue_cv_.notify_all();
     }
     if (enable_stream_[COLOR_RIGHT] && right_color_frame) {
       std::unique_lock<std::mutex> lock(right_color_frame_queue_lock_);
-      while (right_color_frame_queue_.size() >= kFrameQueueMax) {
-        right_color_frame_queue_.pop();   // drop the oldest; see kFrameQueueMax
+      while (right_color_frame_queue_.size() >= static_cast<size_t>(frame_queue_size_)) {
+        right_color_frame_queue_.pop();   // drop the oldest; see frame_queue_size_
       }
       right_color_frame_queue_.push(frame_set);
       right_color_frame_queue_cv_.notify_all();
@@ -3880,8 +3886,8 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
     // too would be a change with nothing measured behind it.
     if (enable_stream_[DEPTH] && frame_set->getFrame(OB_FRAME_DEPTH) != nullptr) {
       std::unique_lock<std::mutex> lock(depth_frame_queue_lock_);
-      while (depth_frame_queue_.size() >= kFrameQueueMax) {
-        depth_frame_queue_.pop();   // drop the oldest; see kFrameQueueMax
+      while (depth_frame_queue_.size() >= static_cast<size_t>(frame_queue_size_)) {
+        depth_frame_queue_.pop();   // drop the oldest; see frame_queue_size_
       }
       depth_frame_queue_.push(frame_set);
       depth_frame_queue_cv_.notify_all();
