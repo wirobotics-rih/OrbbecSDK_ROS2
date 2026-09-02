@@ -18,6 +18,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <string>
@@ -38,6 +39,12 @@ class FpsCounter {
 
   void setLogLevel(LogLevel level) { log_level_ = level; }
 
+  //: The rate this counter last measured, or 0 before the first interval
+  //: closes. Ticked on the driver's frame path, so it is what the camera
+  //: PUBLISHED -- unlike a rate any subscriber measures, which also carries
+  //: whatever that subscriber dropped. Read from the diagnostic updater.
+  double fps() const { return fps_.load(std::memory_order_relaxed); }
+
   void tick() {
     ++frame_count_;
     auto now = std::chrono::steady_clock::now();
@@ -45,6 +52,7 @@ class FpsCounter {
       double fps =
           static_cast<double>(frame_count_) /
           std::chrono::duration_cast<std::chrono::duration<double>>(now - last_print_time_).count();
+      fps_.store(fps, std::memory_order_relaxed);
 
       if (log_level_ == LogLevel::INFO) {
         RCLCPP_INFO_STREAM(logger_, name_ << " FPS " << fps);
@@ -64,6 +72,8 @@ class FpsCounter {
   uint32_t frame_count_;
   LogLevel log_level_;
   rclcpp::Logger logger_;
+  //: Written on the frame thread, read on the diagnostic timer.
+  std::atomic<double> fps_{0.0};
 };
 
 }  // namespace orbbec_camera

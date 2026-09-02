@@ -2850,6 +2850,39 @@ void OBCameraNode::setupTopics() {
   }
 }
 
+void OBCameraNode::onFrameRateUpdate(diagnostic_updater::DiagnosticStatusWrapper &status) {
+  if (!is_running_.load() || !is_camera_node_initialized_.load()) {
+    status.summary(diagnostic_msgs::msg::DiagnosticStatus::STALE, "Not streaming");
+    return;
+  }
+  // No device lock: these are plain counters owned by this node, not device
+  // properties, so nothing here can block on the camera. That matters -- the
+  // whole point is a number that stays readable when other things are stuck.
+  const std::pair<const char *, const FpsCounter *> counters[] = {
+      {"color", fps_counter_color_.get()},
+      {"depth", fps_counter_depth_.get()},
+      {"left_ir", fps_counter_left_ir_.get()},
+      {"right_ir", fps_counter_right_ir_.get()},
+  };
+  int reported = 0;
+  for (const auto &[name, counter] : counters) {
+    if (counter == nullptr) {
+      continue;
+    }
+    double fps = counter->fps();
+    if (fps <= 0.0) {
+      continue;  // stream not enabled, or the first interval has not closed
+    }
+    status.add(name, fps);
+    ++reported;
+  }
+  if (reported == 0) {
+    status.summary(diagnostic_msgs::msg::DiagnosticStatus::STALE, "No stream has a rate yet");
+  } else {
+    status.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "Publishing");
+  }
+}
+
 void OBCameraNode::onTemperatureUpdate(diagnostic_updater::DiagnosticStatusWrapper &status) {
   try {
     // Check to ensure we're not shutting down and device is valid
@@ -2924,6 +2957,16 @@ void OBCameraNode::setupDiagnosticUpdater() {
     diagnostic_updater_ = std::make_unique<diagnostic_updater::Updater>(node_, 10000.0);
     diagnostic_updater_->setHardwareID(serial_number);
     diagnostic_updater_->add("Temperatures", this, &OBCameraNode::onTemperatureUpdate);
+    // Publish the rate the camera is actually publishing at. The counters exist
+    // already and are ticked on the frame path (`fps_counter_depth_->tick()` in
+    // onNewFrameSetCallback), but they only ever reached RCLCPP_INFO, so the
+    // number was in the log and nowhere a program could read it. Everyone else
+    // had to measure the rate from a subscription instead, which reports what
+    // the SUBSCRIBER received -- a reader that stalls then reads as a camera
+    // that slowed down. The RealSense publishes per-stream frequency
+    // diagnostics from its own frame callback (ros_sensor.cpp) and the ZED
+    // publishes its grab cadence; this closes the same gap for the Femto.
+    diagnostic_updater_->add("Frame rates", this, &OBCameraNode::onFrameRateUpdate);
     diagnostic_timer_ =
         node_->create_wall_timer(std::chrono::seconds(int(diagnostic_period_)), [this]() {
           try {

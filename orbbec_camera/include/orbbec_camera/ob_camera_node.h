@@ -252,6 +252,8 @@ class OBCameraNode {
 
   void onTemperatureUpdate(diagnostic_updater::DiagnosticStatusWrapper& status);
 
+  void onFrameRateUpdate(diagnostic_updater::DiagnosticStatusWrapper& status);
+
   void setupCameraCtrlServices();
 
   void stopStreams();
