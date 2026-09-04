@@ -2874,6 +2874,14 @@ void OBCameraNode::onFrameRateUpdate(diagnostic_updater::DiagnosticStatusWrapper
       continue;  // stream not enabled, or the first interval has not closed
     }
     status.add(name, fps);
+    // The device's own cumulative frame index beside the rate. The rate says
+    // how fast the driver published; this says how many the SENSOR produced,
+    // so differencing it upstream separates "the camera did not make it" from
+    // "the driver lost it". Named for the stream so a reader can pair them.
+    const uint64_t idx = counter->deviceIndex();
+    if (idx > 0) {
+      status.add(std::string(name) + "_device_frames", static_cast<double>(idx));
+    }
     ++reported;
   }
   if (reported == 0) {
@@ -3809,14 +3817,14 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
       depth_frame = processDepthFrameFilter(depth_frame);
       if (depth_frame) {
         frame_set->pushFrame(depth_frame);
-        fps_counter_depth_->tick();
+        fps_counter_depth_->tick(depth_frame->getIndex());
       }
     }
     if (color_frame) {
       setColorAutoExposureROI();
       color_frame = processColorFrameFilter(color_frame);
       frame_set->pushFrame(color_frame);
-      fps_counter_color_->tick();
+      fps_counter_color_->tick(color_frame->getIndex());
     }
     if (left_color_frame) {
       setColorAutoExposureROI();
@@ -3830,12 +3838,12 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
     if (left_ir_frame) {
       left_ir_frame = processLeftIrFrameFilter(left_ir_frame);
       frame_set->pushFrame(left_ir_frame);
-      fps_counter_left_ir_->tick();
+      fps_counter_left_ir_->tick(left_ir_frame->getIndex());
     }
     if (right_ir_frame) {
       right_ir_frame = processRightIrFrameFilter(right_ir_frame);
       frame_set->pushFrame(right_ir_frame);
-      fps_counter_right_ir_->tick();
+      fps_counter_right_ir_->tick(right_ir_frame->getIndex());
     }
     if (depth_registration_ && align_filter_ && depth_frame) {
       publishRawDepthImage(depth_frame);

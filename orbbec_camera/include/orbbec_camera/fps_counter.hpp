@@ -19,6 +19,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <chrono>
 #include <functional>
 #include <string>
@@ -44,6 +45,23 @@ class FpsCounter {
   //: PUBLISHED -- unlike a rate any subscriber measures, which also carries
   //: whatever that subscriber dropped. Read from the diagnostic updater.
   double fps() const { return fps_.load(std::memory_order_relaxed); }
+
+  //: The DEVICE's own frame sequence number, as of the last frame this counter
+  //: saw (`ob::Frame::getIndex()`), or 0 if nothing has passed a device index.
+  //:
+  //: A rate cannot answer "did the camera produce it, or did the driver lose
+  //: it": both are rates measured over different windows by different parties.
+  //: A cumulative index can -- differenced over an interval it counts what the
+  //: SENSOR produced, and a frame this driver dropped still shows up as a jump.
+  //: The dashboard reads it out of /diagnostics and differences it there
+  //: (`camera_watch._sensor_count`); this side only has to publish the newest
+  //: value, so a missed diagnostics message costs nothing.
+  uint64_t deviceIndex() const { return device_index_.load(std::memory_order_relaxed); }
+
+  void tick(uint64_t device_index) {
+    device_index_.store(device_index, std::memory_order_relaxed);
+    tick();
+  }
 
   void tick() {
     ++frame_count_;
@@ -74,6 +92,7 @@ class FpsCounter {
   rclcpp::Logger logger_;
   //: Written on the frame thread, read on the diagnostic timer.
   std::atomic<double> fps_{0.0};
+  std::atomic<uint64_t> device_index_{0};
 };
 
 }  // namespace orbbec_camera

@@ -629,6 +629,15 @@ std::string intraCameraSyncReferenceToString(int value) {
   }
 }
 
+// An UNSET parameter is not a bad parameter. These three converters are called
+// with whatever the IMU parameters hold, and the launch leaves them empty
+// whenever the stream is off or the value is left to the device -- which made
+// every start print `Unknown OB_SAMPLE_RATE: ` / `Unknown
+// OB_GYRO_FULL_SCALE_RANGE: ` with nothing after the colon. An empty string
+// carries no request, so it takes the default silently; a non-empty string
+// that is not recognised is still a real mistake and still shouts.
+static inline bool imuValueUnset(const std::string &v) { return v.empty(); }
+
 OB_SAMPLE_RATE sampleRateFromString(std::string &sample_rate) {
   // covert to lower case
   std::transform(sample_rate.begin(), sample_rate.end(), sample_rate.begin(), ::tolower);
@@ -663,7 +672,9 @@ OB_SAMPLE_RATE sampleRateFromString(std::string &sample_rate) {
   } else if (sample_rate == "32khz") {
     return OB_SAMPLE_RATE_32_KHZ;
   } else {
-    RCLCPP_ERROR_STREAM(rclcpp::get_logger("utils"), "Unknown OB_SAMPLE_RATE: " << sample_rate);
+    if (!imuValueUnset(sample_rate)) {
+      RCLCPP_ERROR_STREAM(rclcpp::get_logger("utils"), "Unknown OB_SAMPLE_RATE: " << sample_rate);
+    }
     return OB_SAMPLE_RATE_100_HZ;
   }
 }
@@ -730,8 +741,10 @@ OB_GYRO_FULL_SCALE_RANGE fullGyroScaleRangeFromString(std::string &full_scale_ra
   } else if (full_scale_range == "2000dps") {
     return OB_GYRO_FS_2000dps;
   } else {
-    RCLCPP_ERROR_STREAM(rclcpp::get_logger("utils"),
+    if (!imuValueUnset(full_scale_range)) {
+      RCLCPP_ERROR_STREAM(rclcpp::get_logger("utils"),
                         "Unknown OB_GYRO_FULL_SCALE_RANGE: " << full_scale_range);
+    }
     return OB_GYRO_FS_2000dps;
   }
 }
@@ -784,8 +797,10 @@ OBAccelFullScaleRange fullAccelScaleRangeFromString(std::string &full_scale_rang
   } else if (full_scale_range == "24g") {
     return OB_ACCEL_FS_24g;
   } else {
-    RCLCPP_ERROR_STREAM(rclcpp::get_logger("utils"),
+    if (!imuValueUnset(full_scale_range)) {
+      RCLCPP_ERROR_STREAM(rclcpp::get_logger("utils"),
                         "Unknown OB_ACCEL_FULL_SCALE_RANGE: " << full_scale_range);
+    }
     return OB_ACCEL_FS_16g;
   }
 }
