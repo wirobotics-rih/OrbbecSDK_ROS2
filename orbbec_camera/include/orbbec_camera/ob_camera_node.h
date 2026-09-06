@@ -44,6 +44,7 @@
 #include <image_publisher/image_publisher.hpp>
 #include <image_transport/publisher.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include "libobsensor/ObSensor.hpp"
 
 #include "orbbec_camera_msgs/msg/device_info.hpp"
@@ -462,6 +463,11 @@ class OBCameraNode {
                                                       const stream_index_pair& stream_index);
 
   bool decodeColorFrameToBuffer(const std::shared_ptr<ob::Frame>& frame, uint8_t* buffer);
+
+  // True when this colour frame is one whose MJPG is republished byte for byte
+  // instead of being decoded. See onNewFrameCallback.
+  bool colorPassthrough(const std::shared_ptr<ob::Frame>& frame,
+                        const stream_index_pair& stream_index) const;
 
   std::shared_ptr<ob::Frame> decodeIRMJPGFrame(const std::shared_ptr<ob::Frame>& frame);
 
@@ -934,6 +940,12 @@ class OBCameraNode {
   bool enable_firmware_log_ = false;
   bool enable_color_undistortion_ = false;
   std::shared_ptr<image_publisher> color_undistortion_publisher_;
+  // The sensor already hands this wrapper compressed colour on the cameras that
+  // deliver MJPG, and the wrapper decoded it so that image_transport could
+  // compress it again. With this on, the bytes are published as they arrived and
+  // neither half is paid. See onNewFrameCallback.
+  bool color_mjpg_passthrough_ = false;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr color_passthrough_publisher_;
   bool has_first_color_frame_ = false;
   bool use_intra_process_ = false;
   std::string cloud_frame_id_;

@@ -2687,6 +2687,21 @@ void OBCameraNode::getParameters() {
   setAndGetNodeParameter<bool>(enable_heartbeat_, "enable_heartbeat", false);
   setAndGetNodeParameter<bool>(enable_firmware_log_, "enable_firmware_log", false);
   setAndGetNodeParameter<bool>(enable_color_undistortion_, "enable_color_undistortion", false);
+  // Publish the sensor's own MJPG instead of decoding it.
+  //
+  // This wrapper decodes every colour frame into rgb_buffer_ and publishes a raw
+  // Image; image_transport's `compressed` plugin then encodes a JPEG out of it
+  // again. On a camera whose sensor delivers MJPG that is a decode and an encode
+  // of the same picture, per frame, on the busiest thread the driver has -- for
+  // a result that is strictly worse than the bytes it was handed, because JPEG
+  // is lossy and this is the second generation of it.
+  //
+  // With this on, `<colour>/image_raw/compressed` is published from the frame's
+  // own buffer and neither half happens. The raw Image is still published when
+  // something actually subscribes to it, and the colour undistortion, the
+  // coloured point cloud and `save_images` still get their pixels -- each of
+  // those asks for a decode on its own account.
+  setAndGetNodeParameter<bool>(color_mjpg_passthrough_, "color_mjpg_passthrough", false);
   setAndGetNodeParameter<int>(frame_queue_size_, "frame_queue_size", 4);
   if (frame_queue_size_ < 1) {
     RCLCPP_WARN_STREAM(logger_, "frame_queue_size " << frame_queue_size_
@@ -3130,6 +3145,42 @@ void OBCameraNode::setupPublishers() {
     } else {
       image_publishers_[stream_index] =
           std::make_shared<image_transport_publisher>(*node_, topic, image_qos_profile);
+    }
+
+    if (stream_index == COLOR && color_mjpg_passthrough_) {
+      // Deliberately the same topic name the `compressed` plugin would have
+      // used, so nothing downstream has to know which one wrote a frame -- and
+      // for exactly that reason the plugin must not still be enabled, or the
+      // two of them publish there and every subscriber gets each frame twice.
+      //
+      // image_transport reads that allowlist itself, under the resolved topic
+      // minus this node's namespace with '/' replaced by '.', and it declared
+      // the parameter when the publisher above was constructed. Left unset it
+      // means EVERY plugin, `compressed` among them, so an unset list is a
+      // refusal too. Refused rather than worked around: a passthrough that
+      // silently doubled the frame rate of a recording is worse than one that
+      // says it is off.
+      std::vector<std::string> plugins;
+      node_->get_parameter_or(name + ".image_raw.enable_pub_plugins", plugins,
+                              std::vector<std::string>{});
+      const bool compressed_plugin_on =
+          plugins.empty() || std::find(plugins.begin(), plugins.end(),
+                                       "image_transport/compressed") != plugins.end();
+      if (compressed_plugin_on) {
+        RCLCPP_ERROR_STREAM(
+            logger_, "color_mjpg_passthrough is on but "
+                         << name
+                         << ".image_raw.enable_pub_plugins still allows "
+                            "image_transport/compressed -- passthrough disabled, the plugin will "
+                            "decode and re-encode as before");
+      } else {
+        color_passthrough_publisher_ = node_->create_publisher<sensor_msgs::msg::CompressedImage>(
+            name + "/image_raw/compressed",
+            rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(image_qos_profile), image_qos_profile));
+        RCLCPP_INFO_STREAM(logger_, "color MJPG passthrough on: " << name
+                                                                 << "/image_raw/compressed is the "
+                                                                    "sensor's own JPEG, undecoded");
+      }
     }
 
     topic = name + "/camera_info";
@@ -4140,6 +4191,15 @@ std::shared_ptr<ob::Frame> OBCameraNode::softwareDecodeColorFrame(
   return color_frame;
 }
 
+bool OBCameraNode::colorPassthrough(const std::shared_ptr<ob::Frame> &frame,
+                                    const stream_index_pair &stream_index) const {
+  // Decided per FRAME, not once at startup: the parameter says what was asked
+  // for, the format says what actually arrived. A sensor that is not handing
+  // over MJPG falls back to the ordinary path rather than publishing nothing.
+  return color_mjpg_passthrough_ && stream_index == COLOR && frame != nullptr &&
+         color_passthrough_publisher_ != nullptr && frame->getFormat() == OB_FORMAT_MJPG;
+}
+
 bool OBCameraNode::decodeColorFrameToBuffer(const std::shared_ptr<ob::Frame> &frame,
                                             uint8_t *buffer) {
   if (frame == nullptr) {
@@ -4165,30 +4225,32 @@ bool OBCameraNode::decodeColorFrameToBuffer(const std::shared_ptr<ob::Frame> &fr
       break;
   }
 
-  bool has_subscriber = false;
+  // The question here is not "does anyone want this frame" but "does anyone want
+  // its PIXELS" -- this function's whole job is filling rgb_buffer_.
+  //
+  // camera_info and metadata used to be in this gate, and they need no pixels at
+  // all: one subscriber to camera_info was enough to make the driver decode
+  // every 1920x1080 MJPG frame it received, for a message that is 500 bytes of
+  // intrinsics. They are answered in onNewFrameCallback without any of this.
+  bool needs_pixels = false;
   if (image_publishers_.count(stream_index) && image_publishers_[stream_index]) {
-    has_subscriber = image_publishers_[stream_index]->get_subscription_count() > 0;
+    needs_pixels = image_publishers_[stream_index]->get_subscription_count() > 0;
   }
   if (stream_index == COLOR && enable_color_undistortion_ && color_undistortion_publisher_) {
-    has_subscriber = true;
+    needs_pixels = true;
   }
 
   if (frame->getType() == OB_FRAME_COLOR && enable_colored_point_cloud_ &&
       depth_registration_cloud_pub_ &&
       depth_registration_cloud_pub_->get_subscription_count() > 0) {
-    has_subscriber = true;
+    needs_pixels = true;
   }
 
-  if (metadata_publishers_.count(stream_index) && metadata_publishers_[stream_index] &&
-      metadata_publishers_[stream_index]->get_subscription_count() > 0) {
-    has_subscriber = true;
-  }
-  if (camera_info_publishers_.count(stream_index) && camera_info_publishers_[stream_index] &&
-      camera_info_publishers_[stream_index]->get_subscription_count() > 0) {
-    has_subscriber = true;
+  if (save_images_.count(stream_index) && save_images_[stream_index]) {
+    needs_pixels = true;
   }
 
-  if (!has_subscriber) {
+  if (!needs_pixels) {
     return false;
   }
 
@@ -4281,11 +4343,23 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame> &frame,
     return;
   }
   CHECK_NOTNULL(image_publishers_[stream_index]);
+  const bool passthrough = colorPassthrough(frame, stream_index);
   const bool has_raw_image_subscriber =
       image_publishers_[stream_index]->get_subscription_count() > 0;
+  const bool has_passthrough_subscriber =
+      passthrough && color_passthrough_publisher_->get_subscription_count() > 0;
+  if (color_mjpg_passthrough_ && stream_index == COLOR && !passthrough) {
+    // Asked for and not available. Loud, because the alternative is a colour
+    // topic that quietly stops existing: the plugin allowlist that makes room
+    // for the passthrough is what would otherwise have published this frame.
+    RCLCPP_ERROR_THROTTLE(logger_, *(node_->get_clock()), 5000,
+                          "color_mjpg_passthrough is on but this frame is format %d, not MJPG",
+                          static_cast<int>(frame->getFormat()));
+  }
   const bool enable_undistortion_publish =
       (stream_index == COLOR && enable_color_undistortion_ && color_undistortion_publisher_);
-  bool has_subscriber = has_raw_image_subscriber || enable_undistortion_publish;
+  bool has_subscriber =
+      has_raw_image_subscriber || has_passthrough_subscriber || enable_undistortion_publish;
   has_subscriber =
       has_subscriber || camera_info_publishers_[stream_index]->get_subscription_count() > 0;
   has_subscriber =
@@ -4294,6 +4368,14 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame> &frame,
   if (!has_subscriber) {
     return;
   }
+  // Everything below the camera_info publish is pixel work: a copy out of the
+  // decoded buffer, a cv_bridge conversion and, for depth, a whole-image
+  // multiply. None of it is worth doing for a subscriber that asked for
+  // intrinsics or metadata, and under a passthrough none of it is worth doing at
+  // all -- the bytes go out exactly as the sensor sent them.
+  const bool wants_saved_file = save_images_.count(stream_index) && save_images_[stream_index];
+  const bool needs_pixels =
+      has_raw_image_subscriber || enable_undistortion_publish || wants_saved_file;
   std::shared_ptr<ob::VideoFrame> video_frame;
   if (frame->getType() == OB_FRAME_COLOR || frame->getType() == OB_FRAME_COLOR_LEFT ||
       frame->getType() == OB_FRAME_COLOR_RIGHT) {
@@ -4389,35 +4471,37 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame> &frame,
     camera_info.p.at(7) = -fy * ex.trans[1] / 1000.0 + 0.0;
   }
   CHECK_NOTNULL(image_publishers_[stream_index]);
-  if (image.empty() || image.cols != width || image.rows != height) {
-    image.create(height, width, image_format_[stream_index]);
-  }
-  if (frame->getType() == OB_FRAME_COLOR && !is_color_frame_decoded_) {
-    RCLCPP_ERROR(logger_, "color frame is not decoded");
-    return;
-  }
-  if (frame->getType() == OB_FRAME_COLOR_LEFT && !is_left_color_frame_decoded_) {
-    RCLCPP_ERROR(logger_, "left color frame is not decoded");
-    return;
-  }
-  if (frame->getType() == OB_FRAME_COLOR_RIGHT && !is_right_color_frame_decoded_) {
-    RCLCPP_ERROR(logger_, "right color frame is not decoded");
-    return;
-  }
-  if (frame->getType() == OB_FRAME_COLOR && frame->format() != OB_FORMAT_Y8 &&
-      frame->format() != OB_FORMAT_Y16 && frame->format() != OB_FORMAT_BGRA &&
-      frame->format() != OB_FORMAT_RGBA && has_subscriber) {
-    memcpy(image.data, rgb_buffer_, video_frame->getWidth() * video_frame->getHeight() * 3);
-  } else if (frame->getType() == OB_FRAME_COLOR_LEFT && frame->format() != OB_FORMAT_Y8 &&
-             frame->format() != OB_FORMAT_Y16 && frame->format() != OB_FORMAT_BGRA &&
-             frame->format() != OB_FORMAT_RGBA && has_subscriber) {
-    memcpy(image.data, rgb_buffer_left_, video_frame->getWidth() * video_frame->getHeight() * 3);
-  } else if (frame->getType() == OB_FRAME_COLOR_RIGHT && frame->format() != OB_FORMAT_Y8 &&
-             frame->format() != OB_FORMAT_Y16 && frame->format() != OB_FORMAT_BGRA &&
-             frame->format() != OB_FORMAT_RGBA && has_subscriber) {
-    memcpy(image.data, rgb_buffer_right_, video_frame->getWidth() * video_frame->getHeight() * 3);
-  } else {
-    memcpy(image.data, video_frame->getData(), video_frame->getDataSize());
+  if (needs_pixels) {
+    if (image.empty() || image.cols != width || image.rows != height) {
+      image.create(height, width, image_format_[stream_index]);
+    }
+    if (frame->getType() == OB_FRAME_COLOR && !is_color_frame_decoded_) {
+      RCLCPP_ERROR(logger_, "color frame is not decoded");
+      return;
+    }
+    if (frame->getType() == OB_FRAME_COLOR_LEFT && !is_left_color_frame_decoded_) {
+      RCLCPP_ERROR(logger_, "left color frame is not decoded");
+      return;
+    }
+    if (frame->getType() == OB_FRAME_COLOR_RIGHT && !is_right_color_frame_decoded_) {
+      RCLCPP_ERROR(logger_, "right color frame is not decoded");
+      return;
+    }
+    if (frame->getType() == OB_FRAME_COLOR && frame->format() != OB_FORMAT_Y8 &&
+        frame->format() != OB_FORMAT_Y16 && frame->format() != OB_FORMAT_BGRA &&
+        frame->format() != OB_FORMAT_RGBA) {
+      memcpy(image.data, rgb_buffer_, video_frame->getWidth() * video_frame->getHeight() * 3);
+    } else if (frame->getType() == OB_FRAME_COLOR_LEFT && frame->format() != OB_FORMAT_Y8 &&
+               frame->format() != OB_FORMAT_Y16 && frame->format() != OB_FORMAT_BGRA &&
+               frame->format() != OB_FORMAT_RGBA) {
+      memcpy(image.data, rgb_buffer_left_, video_frame->getWidth() * video_frame->getHeight() * 3);
+    } else if (frame->getType() == OB_FRAME_COLOR_RIGHT && frame->format() != OB_FORMAT_Y8 &&
+               frame->format() != OB_FORMAT_Y16 && frame->format() != OB_FORMAT_BGRA &&
+               frame->format() != OB_FORMAT_RGBA) {
+      memcpy(image.data, rgb_buffer_right_, video_frame->getWidth() * video_frame->getHeight() * 3);
+    } else {
+      memcpy(image.data, video_frame->getData(), video_frame->getDataSize());
+    }
   }
 
   if (enable_undistortion_publish) {
@@ -4442,6 +4526,37 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame> &frame,
   camera_info_publishers_[stream_index]->publish(camera_info);
   publishMetadata(frame, stream_index, camera_info.header);
 
+  // Ticked for every frame that got this far, passthrough included -- this is
+  // what /diagnostics reports as the driver's own rate, and a rate that stops
+  // being counted when the pixels stop being touched would say the camera had
+  // stalled.
+  if (stream_index == COLOR) {
+    fps_delay_status_color_->tick(frame_timestamp);
+  } else if (stream_index == DEPTH) {
+    fps_delay_status_depth_->tick(frame_timestamp);
+  }
+
+  if (has_passthrough_subscriber) {
+    // The sensor's own JPEG, byte for byte. No decode above it and no encode
+    // below it, so this is also the only path here that loses nothing.
+    sensor_msgs::msg::CompressedImage::UniquePtr compressed_msg(
+        new sensor_msgs::msg::CompressedImage());
+    compressed_msg->header.stamp = timestamp;
+    compressed_msg->header.frame_id = frame_id;
+    compressed_msg->format = "jpeg";
+    const auto *jpeg = static_cast<const uint8_t *>(frame->getData());
+    compressed_msg->data.assign(jpeg, jpeg + frame->getDataSize());
+    if (frame_timestamp_csv_logger_ && frame_timestamp_csv_logger_->enabled() &&
+        (stream_index == COLOR || stream_index == DEPTH)) {
+      frame_timestamp_csv_logger_->recordPreImagePublish(stream_index.first, frame,
+                                                         getSystemNowUs(), getSteadyNowUs());
+    }
+    color_passthrough_publisher_->publish(std::move(compressed_msg));
+  }
+
+  if (!needs_pixels) {
+    return;
+  }
   if (stream_index == DEPTH) {
     auto depth_scale = video_frame->as<ob::DepthFrame>()->getValueScale();
     image = image * depth_scale;
@@ -4457,11 +4572,6 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame> &frame,
   image_msg->header.frame_id = frame_id;
   CHECK(image_publishers_.count(stream_index) > 0);
   saveImageToFile(stream_index, image, *image_msg);
-  if (stream_index == COLOR) {
-    fps_delay_status_color_->tick(frame_timestamp);
-  } else if (stream_index == DEPTH) {
-    fps_delay_status_depth_->tick(frame_timestamp);
-  }
   if (has_raw_image_subscriber) {
     if (frame_timestamp_csv_logger_ && frame_timestamp_csv_logger_->enabled() &&
         (stream_index == COLOR || stream_index == DEPTH)) {
